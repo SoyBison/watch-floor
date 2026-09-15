@@ -19,6 +19,10 @@ pub enum Status {
     /// Contents changed but the connections held: a class's method set, or an
     /// operation's signature or decorators.
     Amended,
+    /// Untouched itself, but sitting in the wake of a move made elsewhere: a
+    /// callee relocated out from under it. Reported so the fact is visible,
+    /// but too soft to count as this operation having changed.
+    Wake,
     /// No observed change.
     Nominal,
 }
@@ -34,12 +38,13 @@ impl Status {
     ];
 
     /// Statuses an operation can carry, in legend order.
-    pub const NETWORK: [Status; 5] = [
+    pub const NETWORK: [Status; 6] = [
         Status::Activated,
         Status::Burned,
         Status::Rerouted,
         Status::Relocated,
         Status::Amended,
+        Status::Wake,
     ];
 
     pub fn tag(self) -> &'static str {
@@ -50,6 +55,7 @@ impl Status {
             Status::Rerouted => "REROUTED",
             Status::Relocated => "RELOCATED",
             Status::Amended => "AMENDED",
+            Status::Wake => "WAKE",
             Status::Nominal => "",
         }
     }
@@ -62,12 +68,21 @@ impl Status {
             Status::Realigned | Status::Rerouted => "~",
             Status::Relocated => "→",
             Status::Amended => "*",
+            Status::Wake => "≈",
             Status::Nominal => "·",
         }
     }
 
     pub fn is_change(self) -> bool {
         self != Status::Nominal
+    }
+
+    /// Whether this status alone justifies keeping a branch on screen when the
+    /// changes-only filter is on. A wake is worth reporting but not worth
+    /// dragging a whole branch into view: a widely-called function moving
+    /// would otherwise light up every one of its callers.
+    pub fn holds_branch(self) -> bool {
+        self.is_change() && self != Status::Wake
     }
 }
 
@@ -143,6 +158,7 @@ pub struct Counts {
     pub rerouted: usize,
     pub relocated: usize,
     pub amended: usize,
+    pub wake: usize,
     pub nominal: usize,
 }
 
@@ -155,6 +171,7 @@ impl Counts {
             Status::Rerouted => self.rerouted += 1,
             Status::Relocated => self.relocated += 1,
             Status::Amended => self.amended += 1,
+            Status::Wake => self.wake += 1,
             Status::Nominal => self.nominal += 1,
         }
     }
@@ -167,12 +184,18 @@ impl Counts {
             Status::Rerouted => self.rerouted,
             Status::Relocated => self.relocated,
             Status::Amended => self.amended,
+            Status::Wake => self.wake,
             Status::Nominal => self.nominal,
         }
     }
 
     pub fn changed(&self) -> usize {
-        self.activated + self.burned + self.realigned + self.rerouted + self.relocated + self.amended
+        self.activated
+            + self.burned
+            + self.realigned
+            + self.rerouted
+            + self.relocated
+            + self.amended
     }
 
     pub fn total(&self) -> usize {

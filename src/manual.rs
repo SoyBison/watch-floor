@@ -37,7 +37,10 @@ pub fn pages(width: u16) -> Vec<Line<'static>> {
   thing with the same name and the same connections are merged into one move.",
     ));
 
-    out.extend(rule(width, "TRAFFIC · what changed about a link between two things"));
+    out.extend(rule(
+        width,
+        "TRAFFIC · what changed about a link between two things",
+    ));
     out.extend(edge_legend());
     out.extend(prose(
         "  Only drawn when the caller exists on both sides. Every call out of a brand
@@ -72,8 +75,10 @@ pub fn pages(width: u16) -> Vec<Line<'static>> {
     out.extend(rule(width, "BLIND SPOTS"));
     out.extend(prose(
         "
-  Imports are not followed. Resolution is structural, so a name that is
-  ambiguous across the package resolves to nothing rather than to a guess.
+  Import statements are read, so `from .core import encode` pins down what a
+  bare `encode()` means. What is not followed is re-export chains, `import *`,
+  and anything rebound at run time. A name that stays ambiguous resolves to
+  nothing rather than to a guess.
 
   Module-level code is not attributed to any operation, and its calls are not
   recorded. Work done at import time is invisible here.
@@ -155,6 +160,9 @@ const RESOLUTION: &str = "
   CONFIRMED     read straight off the syntax
                   transmit()       a def in this same module
                   Channel()        a class in this module → its __init__
+                  encode()         a name bound by an import statement, which
+                                   says exactly which def it refers to
+                  core.transmit()  where `core` itself was imported
                   self.open()      walked up the inheritance graph of view 1
                   super().open()   the same walk, starting one level up
                   pkg.mod.fn()     that qualified name exists
@@ -204,7 +212,7 @@ const KEYS: &str = "
 
 /// The status legend, built from the enum so it cannot drift from the code.
 fn status_legend() -> Vec<Line<'static>> {
-    let rows: [(Status, &str, &str); 6] = [
+    let rows: [(Status, &str, &str); 7] = [
         (
             Status::Activated,
             "here now, absent at baseline",
@@ -231,6 +239,11 @@ fn status_legend() -> Vec<Line<'static>> {
             "a move rather than a rewrite; the burned/activated pair is merged",
         ),
         (
+            Status::Wake,
+            "untouched, but a callee moved",
+            "its calls are identical; something it points at was RELOCATED elsewhere",
+        ),
+        (
             Status::Amended,
             "contents moved, connections held",
             "a class's method set, or an operation's params, decorators or async",
@@ -242,11 +255,15 @@ fn status_legend() -> Vec<Line<'static>> {
         out.push(Line::from(vec![
             Span::styled(
                 format!("  {}  ", status.glyph()),
-                Style::default().fg(color(status)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(color(status))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("{:<11}", status.tag()),
-                Style::default().fg(color(status)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(color(status))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(headline.to_string(), Style::default().fg(PROSE)),
         ]));
@@ -268,8 +285,16 @@ fn status_legend() -> Vec<Line<'static>> {
 
 fn edge_legend() -> Vec<Line<'static>> {
     let rows = [
-        (Color::Green, "NEW TRAFFIC", "this caller did not call this callee at baseline"),
-        (Color::Red, "WENT DARK", "it did at baseline, and no longer does"),
+        (
+            Color::Green,
+            "NEW TRAFFIC",
+            "this caller did not call this callee at baseline",
+        ),
+        (
+            Color::Red,
+            "WENT DARK",
+            "it did at baseline, and no longer does",
+        ),
     ];
     let mut out = vec![Line::raw("")];
     for (hue, tag, detail) in rows {
@@ -287,12 +312,28 @@ fn edge_legend() -> Vec<Line<'static>> {
 
 fn markers() -> Vec<Line<'static>> {
     let rows = [
-        ("+Log", Color::Blue, "a base beyond the one the class hangs off"),
-        ("⟨external⟩", Color::Blue, "a name that resolves nowhere inside the package"),
+        (
+            "+Log",
+            Color::Blue,
+            "a base beyond the one the class hangs off",
+        ),
+        (
+            "⟨external⟩",
+            Color::Blue,
+            "a name that resolves nowhere inside the package",
+        ),
         ("?", Color::Gray, "an inferred link — see PROBABLE above"),
-        ("⋯", Color::Gray, "already expanded further up; the branch stops here"),
+        (
+            "⋯",
+            Color::Gray,
+            "already expanded further up; the branch stops here",
+        ),
         ("↻", Color::Blue, "the operation calls itself"),
-        ("<cycle>", Color::Gray, "holds nodes reachable only through a cycle"),
+        (
+            "<cycle>",
+            Color::Gray,
+            "holds nodes reachable only through a cycle",
+        ),
     ];
     let mut out = vec![Line::raw("")];
     for (marker, hue, detail) in rows {
@@ -331,16 +372,29 @@ fn traffic_example() -> Vec<Line<'static>> {
 }
 
 fn rule(width: usize, label: &str) -> Vec<Line<'static>> {
-    let width = width.saturating_sub(label.chars().count() + 7);
+    const LEAD: &str = "  ── ";
+    let lead = LEAD.chars().count();
+    // Lead, a space after the label, and one dash at minimum. A label too long
+    // for the pane is truncated rather than allowed to overrun it.
+    // Rules stop one column short of the pane border. A label too long for the
+    // pane is truncated rather than allowed to overrun it.
+    let budget = width.saturating_sub(lead + 3);
+    let label: String = label.chars().take(budget).collect();
+    let dashes = width.saturating_sub(lead + label.chars().count() + 2);
     vec![
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  ── ", Style::default().fg(CHROME)),
+            Span::styled(LEAD, Style::default().fg(CHROME)),
             Span::styled(
-                label.to_string(),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                label,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" {}", "─".repeat(width)), Style::default().fg(CHROME)),
+            Span::styled(
+                format!(" {}", "─".repeat(dashes)),
+                Style::default().fg(CHROME),
+            ),
         ]),
     ]
 }

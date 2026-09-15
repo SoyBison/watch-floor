@@ -50,6 +50,26 @@ pub enum Confidence {
     Probable,
 }
 
+/// A name an `import` statement bound in some module, and the dotted path it
+/// refers to. Following these turns "one operation happens to have this name"
+/// into "this name is defined to mean that operation".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub local: String,
+    pub target: String,
+}
+
+/// What a call expression turned out to be.
+enum Resolved {
+    /// A call to another operation in the package.
+    To(Link),
+    /// Resolved to something inside the package that has no operation to point
+    /// at — constructing a class that defines no `__init__`. Not external.
+    Inside,
+    /// Left the package, or could not be resolved at all.
+    Away,
+}
+
 /// A resolved call from one operation to another.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
@@ -118,6 +138,8 @@ pub struct Dossier {
     pub files: usize,
     pub subjects: BTreeMap<String, Subject>,
     pub operations: BTreeMap<String, Operation>,
+    /// module -> (local name -> dotted path it was imported from).
+    pub imports: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Dossier {
@@ -127,6 +149,7 @@ impl Dossier {
             files: 0,
             subjects: BTreeMap::new(),
             operations: BTreeMap::new(),
+            imports: BTreeMap::new(),
         }
     }
 
@@ -135,7 +158,15 @@ impl Dossier {
     }
 
     pub fn insert_operation(&mut self, operation: Operation) {
-        self.operations.insert(operation.callsign.clone(), operation);
+        self.operations
+            .insert(operation.callsign.clone(), operation);
+    }
+
+    pub fn insert_binding(&mut self, module: &str, binding: Binding) {
+        self.imports
+            .entry(module.to_string())
+            .or_default()
+            .insert(binding.local, binding.target);
     }
 
     /// Turn the raw call text collected during interception into resolved links.
@@ -154,22 +185,30 @@ impl Dossier {
             .operations
             .values()
             .map(|op| {
-                let mut links: Vec<Link> = Vec::new();
-                let mut seen = BTreeSet::new();
+                // Keyed by target so one callee counts once however many times
+                // it is called, and keeping the BEST grade rather than the
+                // first: `pkg.core.encode()` and a bare `encode()` in the same
+                // body are the same edge, and it is Confirmed if either
+                // spelling pins it down. Without this the grade would depend on
+                // which call site happened to be written first.
+                let mut best: BTreeMap<String, Confidence> = BTreeMap::new();
                 let mut external = 0;
                 let mut recursive = false;
                 for raw in &op.raw_calls {
                     match self.trace(op, raw, &by_name) {
-                        Some(link) if link.target == op.callsign => recursive = true,
-                        Some(link) => {
-                            if seen.insert(link.target.clone()) {
-                                links.push(link);
-                            }
+                        Resolved::To(link) if link.target == op.callsign => recursive = true,
+                        Resolved::To(link) => {
+                            let slot = best.entry(link.target).or_insert(link.confidence);
+                            *slot = (*slot).min(link.confidence);
                         }
-                        None => external += 1,
+                        Resolved::Inside => {}
+                        Resolved::Away => external += 1,
                     }
                 }
-                links.sort_by(|a, b| a.target.cmp(&b.target));
+                let links = best
+                    .into_iter()
+                    .map(|(target, confidence)| Link { target, confidence })
+                    .collect();
                 (op.callsign.clone(), links, external, recursive)
             })
             .collect();
@@ -183,25 +222,15 @@ impl Dossier {
         }
     }
 
-    /// Resolve one call expression to an operation in the package.
+    /// Resolve one call expression, in descending order of certainty.
     fn trace(
         &self,
         op: &Operation,
         raw: &str,
         by_name: &BTreeMap<String, Vec<String>>,
-    ) -> Option<Link> {
-        let confirmed = |target: String| {
-            Some(Link {
-                target,
-                confidence: Confidence::Confirmed,
-            })
-        };
-        let probable = |target: String| {
-            Some(Link {
-                target,
-                confidence: Confidence::Probable,
-            })
-        };
+    ) -> Resolved {
+        let to = |target: String, confidence: Confidence| Resolved::To(Link { target, confidence });
+        let imported = self.imports.get(&op.module);
 
         // `self.m()` / `cls.m()`: walk the class hierarchy we already mapped.
         for prefix in ["self.", "cls."] {
@@ -209,57 +238,102 @@ impl Dossier {
                 if rest.contains('.') {
                     break; // `self.thing.m()` — the receiver is not this class
                 }
-                let owner = op.owner.as_ref()?;
-                return confirmed(self.lookup_method(owner, rest)?);
+                return match op.owner.as_ref().and_then(|o| self.lookup_method(o, rest)) {
+                    Some(hit) => to(hit, Confidence::Confirmed),
+                    None => Resolved::Away,
+                };
             }
         }
 
         // `super().m()`: start one level up.
         if let Some(rest) = raw.strip_prefix("super().") {
-            let owner = op.owner.as_ref()?;
+            let Some(owner) = op.owner.as_ref() else {
+                return Resolved::Away;
+            };
             for base in self.in_package_bases(owner) {
                 if let Some(hit) = self.lookup_method(&base, rest) {
-                    return confirmed(hit);
+                    return to(hit, Confidence::Confirmed);
                 }
             }
-            return None;
+            return Resolved::Away;
         }
 
         if !raw.contains('.') {
             // A module-level function in the same file.
             let local = format!("{}.{}", op.module, raw);
             if self.operations.contains_key(&local) {
-                return confirmed(local);
+                return to(local, Confidence::Confirmed);
             }
             // Constructing a class in the same file runs its __init__.
             if self.subjects.contains_key(&local) {
-                return confirmed(self.lookup_method(&local, "__init__")?);
+                return self.construct(&local, Confidence::Confirmed);
             }
-            // Imported from elsewhere in the package: only module-level
-            // functions are reachable by a bare name.
-            let hit = unique(by_name, raw, |callsign| {
+            // An imported name is not a guess: the import statement says what
+            // it binds to, so this is as certain as a same-module reference.
+            if let Some(target) = imported.and_then(|b| b.get(raw)) {
+                if self.operations.contains_key(target) {
+                    return to(target.clone(), Confidence::Confirmed);
+                }
+                if self.subjects.contains_key(target) {
+                    return self.construct(target, Confidence::Confirmed);
+                }
+            }
+            // Nothing named it outright; fall back to a unique module-level
+            // function carrying the name.
+            return match unique(by_name, raw, |callsign| {
                 self.operations
                     .get(callsign)
                     .is_some_and(|o| o.owner.is_none())
-            })?;
-            return probable(hit);
+            }) {
+                Some(hit) => to(hit, Confidence::Probable),
+                None => Resolved::Away,
+            };
         }
 
         if self.operations.contains_key(raw) {
-            return confirmed(raw.to_string());
+            return to(raw.to_string(), Confidence::Confirmed);
         }
         let qualified = format!("{}.{}", op.module, raw);
         if self.operations.contains_key(&qualified) {
-            return confirmed(qualified);
+            return to(qualified, Confidence::Confirmed);
+        }
+        // `core.transmit()` where `core` was imported: the head names a module
+        // we know, so the whole path is determined.
+        if let Some((head, rest)) = raw.split_once('.') {
+            if let Some(base) = imported.and_then(|b| b.get(head)) {
+                let candidate = format!("{base}.{rest}");
+                if self.operations.contains_key(&candidate) {
+                    return to(candidate, Confidence::Confirmed);
+                }
+                if self.subjects.contains_key(&candidate) {
+                    return self.construct(&candidate, Confidence::Confirmed);
+                }
+            }
         }
         // A dotted path naming a class: again, construction runs __init__.
         if let Some(class) = resolve(&self.subjects, raw, &op.module) {
-            return probable(self.lookup_method(class, "__init__")?);
+            let class = class.to_string();
+            return self.construct(&class, Confidence::Probable);
         }
         // `receiver.m()` where we cannot know the receiver's type: accept the
         // match only when exactly one operation in the package carries the name.
         let leaf = raw.rsplit('.').next().unwrap_or(raw);
-        probable(unique(by_name, leaf, |_| true)?)
+        match unique(by_name, leaf, |_| true) {
+            Some(hit) => to(hit, Confidence::Probable),
+            None => Resolved::Away,
+        }
+    }
+
+    /// Constructing a class runs its `__init__`. A class of ours that defines
+    /// none is still ours — it is not traffic leaving the package.
+    fn construct(&self, class: &str, confidence: Confidence) -> Resolved {
+        match self.lookup_method(class, "__init__") {
+            Some(init) => Resolved::To(Link {
+                target: init,
+                confidence,
+            }),
+            None => Resolved::Inside,
+        }
     }
 
     /// Find `method` on a class or anything it inherits from in-package.

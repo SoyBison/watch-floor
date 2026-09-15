@@ -170,8 +170,7 @@ impl Structure {
                     .iter()
                     .filter_map(|k| grow(k, &self.entries, &by_parent, &mut placed))
                     .collect();
-                let mut node =
-                    TreeNode::new(NodeKey::External(name.clone()), name.clone());
+                let mut node = TreeNode::new(NodeKey::External(name.clone()), name.clone());
                 node.touched = children.iter().any(|c| c.touched);
                 node.children = children;
                 node
@@ -244,7 +243,7 @@ fn grow(
         NodeKey::Subject(qualname.to_string()),
         entry.subject.display_name(),
     );
-    node.touched = entry.status.is_change() || children.iter().any(|c| c.touched);
+    node.touched = entry.status.holds_branch() || children.iter().any(|c| c.touched);
     node.children = children;
     Some(node)
 }

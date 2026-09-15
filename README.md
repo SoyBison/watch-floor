@@ -100,8 +100,9 @@ Call resolution is best-effort by necessity, since Python dispatches at runtime,
 so every edge carries a confidence and the header reports the ratio:
 
 - **Confirmed** — a same-module `def`, a class construction resolving to its
-  `__init__`, a qualified name that exists, or `self.m()` / `super().m()` walked
-  up the inheritance graph the structure view already built.
+  `__init__`, a name bound by an import statement, a qualified name that exists,
+  or `self.m()` / `super().m()` walked up the inheritance graph the structure
+  view already built.
 - **Probable** (`?`) — exactly one operation in the package carries that name and
   the receiver's type can't be known from syntax alone.
 - **Dropped** — ambiguous, or outside the package. Counted as traffic leaving the
@@ -121,6 +122,7 @@ worked examples and the exact tree-sitter node each term is read off.
 | `~` | REROUTED | an operation changed who it calls |
 | `→` | RELOCATED | same thing, same links, new module — a move, not a rewrite |
 | `*` | AMENDED | contents moved, connections held (method set; params, decorators, async) |
+| `≈` | WAKE | untouched itself, but a callee RELOCATED out from under it |
 | `·` | NOMINAL | no observed difference |
 
 | tag | means |
@@ -131,6 +133,10 @@ worked examples and the exact tree-sitter node each term is read off.
 Edge tags are only drawn when the caller exists on both sides — every call out
 of a brand-new function is new by definition, and flagging all of them tells you
 nothing.
+
+WAKE is deliberately quiet: it is counted and listed, but never survives the
+changes-only filter on its own, so a widely-called function moving does not light
+up every one of its callers.
 
 | marker | means |
 | --- | --- |
@@ -163,8 +169,9 @@ snapshots, 8400 operations, 16000 links, both views recompiled.
 
 ## Known limits
 
-- **Imports are not followed.** Resolution is structural, so a name that is
-  ambiguous across the package resolves to nothing rather than to a guess.
+- **Re-export chains and `import *` are not followed.** Plain import statements
+  are read, so `from .core import encode` pins down what a bare `encode()` means,
+  but a name that stays ambiguous resolves to nothing rather than to a guess.
 - **Module-level code is not attributed to any operation**, and its calls are not
   recorded. Work done at import time is invisible.
 - **A method reached only through its base class has no in-package caller**, so it

@@ -55,6 +55,28 @@ impl Target {
         (!id.is_empty()).then_some(id)
     }
 
+    /// A path relative to the package directory, given one relative to the
+    /// repository root.
+    fn package_path<'a>(&self, repo_rel: &'a str) -> &'a str {
+        if self.pkg_rel.is_empty() {
+            repo_rel
+        } else {
+            repo_rel
+                .strip_prefix(&format!("{}/", self.pkg_rel))
+                .unwrap_or(repo_rel)
+        }
+    }
+
+    /// A path relative to the repository root, given one relative to the
+    /// package directory.
+    fn repo_path(&self, pkg_rel_path: &str) -> String {
+        if self.pkg_rel.is_empty() {
+            pkg_rel_path.to_string()
+        } else {
+            format!("{}/{}", self.pkg_rel, pkg_rel_path)
+        }
+    }
+
     /// Read the package as it exists on disk right now.
     pub fn survey_working_tree(&self, interceptor: &mut Interceptor) -> Result<Dossier> {
         let mut dossier = Dossier::new("working tree");
@@ -71,7 +93,7 @@ impl Target {
                 .to_string_lossy()
                 .replace('\\', "/");
             let module = module_of(&rel, &self.pkg_name);
-            let shown = format!("{}/{}", self.pkg_rel, rel);
+            let shown = self.repo_path(&rel);
             dossier.files += 1;
             let sweep = interceptor.sweep(&source, &module, &shown);
             for subject in sweep.subjects {
@@ -79,6 +101,9 @@ impl Target {
             }
             for operation in sweep.operations {
                 dossier.insert_operation(operation);
+            }
+            for binding in sweep.imports {
+                dossier.insert_binding(&module, binding);
             }
         }
         dossier.wire();
@@ -92,20 +117,31 @@ impl Target {
         };
         let mut dossier = Dossier::new(format!("HEAD @ {head}"));
 
+        // An empty pkg_rel means the repository root is itself the package;
+        // git rejects "" as a pathspec and wants "." for "everything".
+        let pathspec = if self.pkg_rel.is_empty() {
+            "."
+        } else {
+            self.pkg_rel.as_str()
+        };
         let listing = git(
             &self.repo_root,
-            &["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", &self.pkg_rel],
+            &["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", pathspec],
         )?;
         let listing = String::from_utf8_lossy(&listing);
 
         for path in listing.split('\0').filter(|p| p.ends_with(".py")) {
+            let rel = self.package_path(path);
+            // The working-tree walk skips these; the baseline must agree, or a
+            // committed __pycache__ shows up as classes that exist only at
+            // baseline and are reported BURNED on an untouched tree.
+            if in_skipped_dir(rel) {
+                continue;
+            }
             let Ok(blob) = git(&self.repo_root, &["show", &format!("HEAD:{path}")]) else {
                 continue;
             };
             let source = String::from_utf8_lossy(&blob);
-            let rel = path
-                .strip_prefix(&format!("{}/", self.pkg_rel))
-                .unwrap_or(path);
             let module = module_of(rel, &self.pkg_name);
             dossier.files += 1;
             let sweep = interceptor.sweep(&source, &module, path);
@@ -114,6 +150,9 @@ impl Target {
             }
             for operation in sweep.operations {
                 dossier.insert_operation(operation);
+            }
+            for binding in sweep.imports {
+                dossier.insert_binding(&module, binding);
             }
         }
         dossier.wire();
@@ -133,6 +172,17 @@ fn module_of(rel: &str, pkg_name: &str) -> String {
         parts.push(part.to_string());
     }
     parts.join(".")
+}
+
+/// Whether any DIRECTORY component of a package-relative path is one the
+/// working-tree walk refuses to descend into. The file name itself is exempt,
+/// matching `collect_py`, which only applies the rule to directories.
+fn in_skipped_dir(rel: &str) -> bool {
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop();
+    parts
+        .iter()
+        .any(|part| part.starts_with('.') || matches!(*part, "__pycache__" | "node_modules"))
 }
 
 fn collect_py(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {

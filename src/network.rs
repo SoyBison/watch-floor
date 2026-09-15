@@ -22,6 +22,9 @@ pub struct Entry {
     pub lost: Vec<String>,
     /// The inherited method this one overrides, as a display name.
     pub overrides: Option<String>,
+    /// Callees that relocated out from under this operation, as callsigns.
+    /// Populated for Status::Wake.
+    pub moved: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,6 +73,7 @@ impl Network {
                         gained,
                         lost,
                         overrides: None,
+                        moved: Vec::new(),
                     }
                 }
                 None => Entry {
@@ -80,6 +84,7 @@ impl Network {
                     gained: Vec::new(),
                     lost: Vec::new(),
                     overrides: None,
+                    moved: Vec::new(),
                 },
             };
             entries.insert(callsign.clone(), entry);
@@ -99,11 +104,13 @@ impl Network {
                     gained: Vec::new(),
                     lost: Vec::new(),
                     overrides: None,
+                    moved: Vec::new(),
                 },
             );
         }
 
         let remap = pair_relocations(&mut entries);
+        absorb_relocations(&mut entries, baseline, current, &remap);
 
         // Resolve call targets to readable names, and note overrides.
         let names: BTreeMap<String, String> = entries
@@ -119,6 +126,19 @@ impl Network {
         for entry in entries.values_mut() {
             entry.gained = entry.gained.iter().map(show).collect();
             entry.lost = entry.lost.iter().map(show).collect();
+            entry.moved = entry
+                .moved
+                .iter()
+                .map(|callsign| match names.get(callsign) {
+                    Some(name) => {
+                        let module = callsign
+                            .strip_suffix(&format!(".{name}"))
+                            .unwrap_or(callsign);
+                        format!("{name} moved to {module}")
+                    }
+                    None => format!("{} moved", leaf(callsign)),
+                })
+                .collect();
             let source = if current.operations.contains_key(&entry.operation.callsign) {
                 current
             } else {
@@ -152,7 +172,12 @@ impl Network {
 
     /// Lay the call graph out from its entry points. Cycles and shared callees
     /// are expanded once; later appearances are drawn as leaves.
-    fn build_forest(&mut self, baseline: &Dossier, current: &Dossier, remap: &BTreeMap<String, String>) {
+    fn build_forest(
+        &mut self,
+        baseline: &Dossier,
+        current: &Dossier,
+        remap: &BTreeMap<String, String>,
+    ) {
         let mut wires: BTreeMap<String, BTreeMap<String, Wire>> = BTreeMap::new();
         // A relocated operation is keyed by where it is now; its baseline self
         // sits under the callsign it used to have.
@@ -280,7 +305,7 @@ impl Network {
         if !expanded.insert(callsign.to_string()) {
             // Seen further up or in an earlier branch: draw the node, stop here.
             node.repeat = true;
-            node.touched = entry.status.is_change() || edge.is_change();
+            node.touched = entry.status.holds_branch() || edge.is_change();
             return Some(node);
         }
 
@@ -296,9 +321,8 @@ impl Network {
         children.sort_by(|a, b| a.0.cmp(&b.0));
 
         node.children = children.into_iter().map(|(_, c)| c).collect();
-        node.touched = entry.status.is_change()
-            || edge.is_change()
-            || node.children.iter().any(|c| c.touched);
+        node.touched =
+            entry.status.is_change() || edge.is_change() || node.children.iter().any(|c| c.touched);
         Some(node)
     }
 
@@ -317,6 +341,65 @@ impl Network {
             (a.status, &a.operation.callsign).cmp(&(b.status, &b.operation.callsign))
         });
         feed
+    }
+}
+
+/// A callee moving does not change its callers. Statuses are computed from raw
+/// target sets before relocations are known, so a caller of a moved operation
+/// looks REROUTED — and prints the same name as both gained and lost, since the
+/// old and new callsigns share a leaf. Redo those deltas against the remapped
+/// baseline so the move is reported once, on the thing that moved.
+fn absorb_relocations(
+    entries: &mut BTreeMap<String, Entry>,
+    baseline: &Dossier,
+    current: &Dossier,
+    remap: &BTreeMap<String, String>,
+) {
+    if remap.is_empty() {
+        return;
+    }
+    for entry in entries.values_mut() {
+        if entry.status != Status::Rerouted {
+            continue;
+        }
+        let callsign = &entry.operation.callsign;
+        let (Some(then), Some(now)) = (
+            baseline.operations.get(callsign),
+            current.operations.get(callsign),
+        ) else {
+            continue;
+        };
+
+        let before: Vec<String> = then
+            .targets()
+            .into_iter()
+            .map(|t| remap.get(&t).cloned().unwrap_or(t))
+            .collect();
+        let (gained, lost) = delta(&before, &now.targets());
+        if !gained.is_empty() || !lost.is_empty() {
+            entry.gained = gained;
+            entry.lost = lost;
+            continue;
+        }
+
+        // Every apparent change was a callee moving. Record that it happened —
+        // it is worth knowing why the callsigns shifted — but do not claim this
+        // operation was rerouted, because its own calls are untouched.
+        entry.gained.clear();
+        entry.lost.clear();
+        entry.moved = then
+            .targets()
+            .into_iter()
+            .filter_map(|t| remap.get(&t).cloned())
+            .collect();
+        entry.status = if then.params != now.params
+            || then.decorators != now.decorators
+            || then.is_async != now.is_async
+        {
+            Status::Amended
+        } else {
+            Status::Wake
+        };
     }
 }
 

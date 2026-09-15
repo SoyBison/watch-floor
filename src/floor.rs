@@ -6,15 +6,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::app::{App, Pane, View};
 use crate::manual;
 use crate::network;
 use crate::sitrep::{leaf, Counts, Edge, NodeKey, Row, Status};
 use crate::structure;
-use crate::{App, Pane, View};
 
 const DIM: Color = Color::DarkGray;
 const EXTERNAL: Color = Color::Blue;
 const CHROME: Color = Color::Rgb(90, 100, 110);
+const WAKE: Color = Color::Rgb(112, 130, 152);
 
 pub fn color(status: Status) -> Color {
     match status {
@@ -23,6 +24,8 @@ pub fn color(status: Status) -> Color {
         Status::Realigned | Status::Rerouted => Color::Yellow,
         Status::Relocated => Color::Magenta,
         Status::Amended => Color::Cyan,
+        // Softer than any real change: present, but never the loudest thing.
+        Status::Wake => WAKE,
         Status::Nominal => Color::Gray,
     }
 }
@@ -38,7 +41,11 @@ fn edge_color(edge: Edge) -> Color {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
 
     header(frame, chunks[0], app);
@@ -83,7 +90,9 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
     for status in legend {
         let n = counts.of(*status);
         let style = if n > 0 {
-            Style::default().fg(color(*status)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(color(*status))
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(DIM)
         };
@@ -124,25 +133,41 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(
                 "WATCH FLOOR",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ·  target ", Style::default().fg(DIM)),
             Span::styled(
                 app.target.pkg_name.clone(),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  ({}/)   ", app.target.pkg_rel), Style::default().fg(DIM)),
+            Span::styled(
+                format!("  ({}/)   ", app.target.pkg_rel),
+                Style::default().fg(DIM),
+            ),
             tab(View::Structure, "STRUCTURE", "1"),
             Span::raw(" "),
             tab(View::Network, "TRAFFIC", "2"),
         ]),
         Line::from(vec![
             Span::styled("  baseline ", Style::default().fg(DIM)),
-            Span::styled(app.baseline.label.clone(), Style::default().fg(Color::Yellow)),
-            Span::styled(format!(" ({} files)", app.baseline.files), Style::default().fg(DIM)),
+            Span::styled(
+                app.baseline.label.clone(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!(" ({} files)", app.baseline.files),
+                Style::default().fg(DIM),
+            ),
             Span::styled("   current ", Style::default().fg(DIM)),
             Span::styled(app.current.label.clone(), Style::default().fg(Color::Green)),
-            Span::styled(format!(" ({} files)", app.current.files), Style::default().fg(DIM)),
+            Span::styled(
+                format!(" ({} files)", app.current.files),
+                Style::default().fg(DIM),
+            ),
             Span::styled(
                 format!("   resynced {age}s ago in {}ms", app.scan_ms),
                 Style::default().fg(DIM),
@@ -242,7 +267,10 @@ fn network_rows(app: &App) -> Vec<Line<'static>> {
 }
 
 fn chrome(row: &Row) -> Vec<Span<'static>> {
-    vec![Span::styled(row.prefix.clone(), Style::default().fg(CHROME))]
+    vec![Span::styled(
+        row.prefix.clone(),
+        Style::default().fg(CHROME),
+    )]
 }
 
 fn external(name: &str) -> Vec<Span<'static>> {
@@ -273,7 +301,9 @@ fn tag(text: &str, hue: Color) -> Span<'static> {
 
 fn pane_tree(frame: &mut Frame, area: Rect, app: &mut App, mut lines: Vec<Line<'static>>) {
     let height = area.height.saturating_sub(2) as usize;
-    app.tree_scroll = app.tree_scroll.min(lines.len().saturating_sub(height.max(1)));
+    app.tree_scroll = app
+        .tree_scroll
+        .min(lines.len().saturating_sub(height.max(1)));
 
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -285,7 +315,11 @@ fn pane_tree(frame: &mut Frame, area: Rect, app: &mut App, mut lines: Vec<Line<'
             Style::default().fg(DIM),
         )));
     }
-    let view: Vec<Line> = lines.into_iter().skip(app.tree_scroll).take(height).collect();
+    let view: Vec<Line> = lines
+        .into_iter()
+        .skip(app.tree_scroll)
+        .take(height)
+        .collect();
 
     let title = format!(
         " {} {}",
@@ -293,7 +327,11 @@ fn pane_tree(frame: &mut Frame, area: Rect, app: &mut App, mut lines: Vec<Line<'
             View::Structure => "INHERITANCE STRUCTURE",
             View::Network => "CALL TRAFFIC · from entry points",
         },
-        if app.changes_only { "· changes only " } else { "" }
+        if app.changes_only {
+            "· changes only "
+        } else {
+            ""
+        }
     );
     frame.render_widget(
         Paragraph::new(view).block(pane(title, app.focus == Pane::Tree)),
@@ -316,8 +354,14 @@ fn pane_feed(
     }
 
     let height = area.height.saturating_sub(2) as usize;
-    app.feed_scroll = app.feed_scroll.min(lines.len().saturating_sub(height.max(1)));
-    let view: Vec<Line> = lines.into_iter().skip(app.feed_scroll).take(height).collect();
+    app.feed_scroll = app
+        .feed_scroll
+        .min(lines.len().saturating_sub(height.max(1)));
+    let view: Vec<Line> = lines
+        .into_iter()
+        .skip(app.feed_scroll)
+        .take(height)
+        .collect();
 
     let title = format!(" SITREP · {items} items ");
     frame.render_widget(
@@ -332,7 +376,11 @@ fn pane_manual(frame: &mut Frame, area: Rect, app: &mut App) {
     let height = area.height.saturating_sub(2) as usize;
     app.help_scroll = app.help_scroll.min(total.saturating_sub(height.max(1)));
     let shown = (app.help_scroll + height).min(total);
-    let view: Vec<Line> = lines.into_iter().skip(app.help_scroll).take(height).collect();
+    let view: Vec<Line> = lines
+        .into_iter()
+        .skip(app.help_scroll)
+        .take(height)
+        .collect();
 
     let title = format!(" FIELD MANUAL · reading the floor · {shown}/{total} ");
     frame.render_widget(Paragraph::new(view).block(pane(title, true)), area);
@@ -342,7 +390,9 @@ fn headline(status: Status, name: String, module: String) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {} {:<9} ", status.glyph(), status.tag()),
-            Style::default().fg(color(status)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color(status))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(name, Style::default().fg(Color::White)),
         Span::styled(format!("  {module}"), Style::default().fg(DIM)),
@@ -425,7 +475,11 @@ fn network_report(entry: &network::Entry) -> Vec<Line<'static>> {
     )];
     match entry.status {
         Status::Activated => {
-            let calls: Vec<String> = op.links.iter().map(|l| leaf(&l.target).to_string()).collect();
+            let calls: Vec<String> = op
+                .links
+                .iter()
+                .map(|l| leaf(&l.target).to_string())
+                .collect();
             lines.push(detail(if calls.is_empty() {
                 format!("calls nothing in-package, {} out", op.external)
             } else {
@@ -433,6 +487,7 @@ fn network_report(entry: &network::Entry) -> Vec<Line<'static>> {
             }));
         }
         Status::Burned => lines.push(detail(format!("was at {}", op.source()))),
+        Status::Wake => lines.extend(entry.moved.iter().map(|m| detail(m.clone()))),
         Status::Amended => lines.push(detail(format!(
             "({}) → {}",
             entry.prior_params.join(", "),

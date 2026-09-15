@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One in-flight run per ref. Pushing again to a PR cancels the stale run instead
+# of queueing a second copy of the whole matrix.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are errors everywhere, not just under clippy. Registry dependencies
+  # are built with --cap-lints allow, so this only ever fails on our own code.
+  RUSTFLAGS: -D warnings
+
+# The four jobs are deliberately independent (no `needs:`): a formatting nit
+# should not hide a real test failure, and vice versa. They are cheap enough
+# that running them all on every push is worth the faster feedback.
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # dtolnay/rust-toolchain installs the minimal profile, which does not
+          # ship rustfmt or clippy — they have to be requested by name.
+          components: rustfmt
+      # No rust-cache here: rustfmt never compiles anything, so there are no
+      # build artifacts worth saving and the cache round-trip is pure overhead.
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Report both platforms even when one fails; a macOS-only break is
+      # exactly the thing this matrix exists to surface.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # No windows-latest job: the TUI targets unix (it reaches for libc and
+        # a unix terminal) and nothing has been verified on Windows. A job here
+        # would be red for reasons unrelated to the change under test, so the
+        # platform is left unsupported on purpose rather than pretended at.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The suite shells out to `git` (preinstalled on both runners) but builds
+      # a throwaway repo with its own isolated config, so there is deliberately
+      # no `git config --global user.email` step: needing one would be a bug in
+      # the harness, and this job is what would catch it.
+      - name: cargo test
+        # --all-targets covers lib, bin, and the integration tests under tests/.
+        # It does skip doctests; the crate has none worth gating on today.
+        run: cargo test --all-targets
+
+  msrv:
+    name: msrv (1.90)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Kept in lockstep with `rust-version` in Cargo.toml by the guard step
+      # below. The toolchain ref on the action has to be a literal, so this
+      # cannot simply be read out of Cargo.toml at runtime.
+      MSRV: "1.90"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the pinned toolchain still matches Cargo.toml
+        shell: bash
+        run: |
+          # `|| true` keeps the `set -o pipefail` shell from dying silently if
+          # the key is gone; an empty result is reported as a mismatch instead.
+          declared="$(grep -E '^rust-version[[:space:]]*=' Cargo.toml | head -n 1 | cut -d'"' -f 2 || true)"
+          if [ "$declared" != "$MSRV" ]; then
+            echo "::error file=Cargo.toml::rust-version is '${declared:-<missing>}' but the msrv job pins '$MSRV'; update .github/workflows/ci.yml to match."
+            exit 1
+          fi
+          echo "Cargo.toml rust-version = $declared, matches the pinned toolchain."
+      - uses: dtolnay/rust-toolchain@1.90
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        # Plain `cargo check` on purpose: the MSRV promise covers the library
+        # and the binary, not the dev-dependencies, which are free to require a
+        # newer compiler than consumers of this crate ever need.
+        run: cargo check

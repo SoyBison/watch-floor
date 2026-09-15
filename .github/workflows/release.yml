@@ -1,0 +1,231 @@
+# Release pipeline.
+#
+# Two things happen here, and they are deliberately separate:
+#
+#   1. EVERY push to main (and every manual run) builds optimised binaries for
+#      all supported targets and uploads them as workflow artifacts. So any
+#      merge to main is downloadable, even if it is not a release.
+#
+#   2. A real GitHub Release is cut ONLY when the version in Cargo.toml has no
+#      matching `v<version>` git tag yet. Bumping the version in Cargo.toml and
+#      merging is therefore the act that publishes a release; ordinary merges
+#      re-use the existing version, find the tag already present, and stop
+#      after step 1 without spamming releases.
+#
+# The gate is computed once in the `version` job and consumed by the `release`
+# job via `needs.version.outputs.should_release`.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only by default; only the `release` job widens this to contents: write.
+permissions:
+  contents: read
+
+# Never let two release runs for the same ref race each other into tag/release
+# creation. Do not cancel in progress: a half-published release is worse than a
+# slow queue.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Binary name == package name in Cargo.toml.
+  BIN_NAME: watch-floor
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide the version, and whether it is new enough to deserve a release.
+  # ---------------------------------------------------------------------------
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags, so the local tag check below is meaningful.
+          fetch-depth: 0
+
+      - name: Read version from Cargo.toml and check for an existing tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Parse [package] version without pulling in a TOML tool. The awk
+          # tracks which table it is inside so a `version = "..."` line under
+          # [dependencies] cannot be mistaken for the package version.
+          version="$(awk -F'=' '
+            /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*$/); next }
+            in_pkg && $1 ~ /^[[:space:]]*version[[:space:]]*$/ {
+              sub(/^[^=]*=[[:space:]]*/, "", $0); sub(/^"/, "", $0); sub(/".*$/, "", $0); print; exit
+            }' Cargo.toml)"
+
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::could not parse [package] version from Cargo.toml"
+            exit 1
+          fi
+
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          # The gate: a release is cut only if `v<version>` does not exist yet.
+          # Check the remote first (authoritative, and sees tags pushed by a
+          # concurrent run), then the local clone as a fallback.
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 \
+            || git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            should_release=false
+            echo "Tag $tag already exists -> building artifacts only, no release."
+          else
+            should_release=true
+            echo "Tag $tag does not exist -> this run will cut a release."
+          fi
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### watch-floor $tag"
+            echo
+            echo "- version from Cargo.toml: \`$version\`"
+            echo "- cut a GitHub Release: \`$should_release\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Always build. Runs on every push to main regardless of the release gate.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One broken target should not deprive us of the others' artifacts.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # tree-sitter compiles C, so a musl-capable C compiler (musl-gcc)
+          # must be on PATH or the build fails at the cc crate, not at link.
+          sudo apt-get install --no-install-recommends -y musl-tools
+          musl-gcc --version
+
+      - name: Add Rust target ${{ matrix.target }}
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          # Target-scoped, so these are simply ignored by the other matrix legs.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage and compress archive
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="$BIN_NAME-$VERSION-$TARGET"
+          mkdir -p "dist/$stage"
+
+          cp "target/$TARGET/release/$BIN_NAME" "dist/$stage/"
+          cp README.md "dist/$stage/"
+          # The licence file, under whichever of the usual names it exists.
+          for f in LICENSE LICENSE.md LICENSE.txt LICENCE LICENCE.md LICENCE.txt COPYING UNLICENSE; do
+            if [ -f "$f" ]; then cp "$f" "dist/$stage/"; fi
+          done
+
+          tar -C dist -czf "dist/$stage.tar.gz" "$stage"
+          rm -rf "dist/${stage:?}"
+          tar -tzf "dist/$stage.tar.gz"
+          echo "archive=dist/$stage.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-floor-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Cut the release. Skipped entirely unless the version job said the version
+  # is new (i.e. `v<version>` has no tag yet).
+  # ---------------------------------------------------------------------------
+  release:
+    name: publish release
+    needs: [version, build]
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to create the tag and the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags must be visible to `gh release create`
+
+      - name: Download all build archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: watch-floor-${{ needs.version.outputs.version }}-*
+          merge-multiple: true
+          path: dist
+
+      - name: List archives
+        shell: bash
+        run: ls -l dist
+
+      - name: Create tag and GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Race guard: another run (or a human) may have tagged/released this
+          # version between the `version` job and now. Both branches below are
+          # idempotent, and neither fails the pipeline for losing the race.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists; uploading archives to it instead."
+            gh release upload "$TAG" dist/*.tar.gz --clobber
+
+          # `gh release create` creates the tag at --target as well, so this is
+          # the single step that both tags and publishes.
+          elif ! gh release create "$TAG" dist/*.tar.gz \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --generate-notes; then
+            echo "::warning::Creating release $TAG failed (most likely a concurrent run won the race); retrying as an upload."
+            gh release upload "$TAG" dist/*.tar.gz --clobber
+          fi
+
+          echo "Release $TAG: $(gh release view "$TAG" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"

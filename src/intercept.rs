@@ -5,13 +5,16 @@
 use anyhow::Result;
 use tree_sitter::{Node, Parser};
 
-use crate::dossier::{Operation, Subject};
+use crate::dossier::{Binding, Operation, Subject};
 
 /// Everything lifted out of one source file.
 #[derive(Default)]
 pub struct Sweep {
     pub subjects: Vec<Subject>,
     pub operations: Vec<Operation>,
+    /// Names this module imported, resolved to dotted paths. Knowing that
+    /// `encode` here means `pkg.core.encode` turns a guess into a fact.
+    pub imports: Vec<Binding>,
 }
 
 pub struct Interceptor {
@@ -36,6 +39,13 @@ impl Interceptor {
             file,
             prefix: module,
             owner: None,
+            // `from .x import y` means something different inside __init__.py:
+            // the leading dot is this package, not its parent.
+            package: if file.ends_with("__init__.py") {
+                module.to_string()
+            } else {
+                parent_module(module)
+            },
         };
         walk(tree.root_node(), source.as_bytes(), &scope, &[], &mut sweep);
         sweep
@@ -49,6 +59,8 @@ struct Scope<'a> {
     file: &'a str,
     prefix: &'a str,
     owner: Option<&'a str>,
+    /// The package a single leading dot refers to.
+    package: String,
 }
 
 fn walk(node: Node, src: &[u8], scope: &Scope, decorators: &[String], out: &mut Sweep) {
@@ -79,6 +91,7 @@ fn walk_one(node: Node, src: &[u8], scope: &Scope, decorators: &[String], out: &
                     file: scope.file,
                     prefix: &qualname,
                     owner: Some(&qualname),
+                    package: scope.package.clone(),
                 };
                 walk(body, src, &inner, &[], out);
             }
@@ -95,11 +108,114 @@ fn walk_one(node: Node, src: &[u8], scope: &Scope, decorators: &[String], out: &
                     file: scope.file,
                     prefix: &callsign,
                     owner: None,
+                    package: scope.package.clone(),
                 };
                 walk(body, src, &inner, &[], out);
             }
         }
+        "import_statement" | "import_from_statement" => {
+            out.imports.extend(bindings_of(node, src, scope));
+        }
         _ => walk(node, src, scope, decorators, out),
+    }
+}
+
+/// Names an import statement binds in this module, resolved to dotted paths.
+/// Only the forms that let us name a target exactly are recorded; a bare
+/// `import a.b.c` binds `a` to itself and tells us nothing new.
+fn bindings_of(node: Node, src: &[u8], scope: &Scope) -> Vec<Binding> {
+    let mut out = Vec::new();
+
+    if node.kind() == "import_statement" {
+        // Only the aliased form is informative: `import pkg.core as core`.
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "aliased_import" {
+                let (Some(name), Some(alias)) = (
+                    child.child_by_field_name("name"),
+                    child.child_by_field_name("alias"),
+                ) else {
+                    continue;
+                };
+                out.push(Binding {
+                    local: text(alias, src),
+                    target: text(name, src),
+                });
+            }
+        }
+        return out;
+    }
+
+    // `from <module> import a, b as c`
+    let Some(module_node) = node.child_by_field_name("module_name") else {
+        return out;
+    };
+    let Some(base) = import_base(module_node, src, scope) else {
+        return out;
+    };
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.id() == module_node.id() {
+            continue;
+        }
+        let (local, name) = match child.kind() {
+            "dotted_name" => {
+                let text = text(child, src);
+                (text.clone(), text)
+            }
+            "aliased_import" => {
+                let (Some(name), Some(alias)) = (
+                    child.child_by_field_name("name"),
+                    child.child_by_field_name("alias"),
+                ) else {
+                    continue;
+                };
+                (text(alias, src), text(name, src))
+            }
+            // `from x import *` binds nothing we can name.
+            _ => continue,
+        };
+        out.push(Binding {
+            local,
+            target: format!("{base}.{name}"),
+        });
+    }
+    out
+}
+
+/// The dotted path a `from ...` clause points at, resolving leading dots
+/// against the module's own package.
+fn import_base(module_node: Node, src: &[u8], scope: &Scope) -> Option<String> {
+    if module_node.kind() != "relative_import" {
+        return Some(text(module_node, src));
+    }
+
+    let raw = text(module_node, src);
+    let dots = raw.chars().take_while(|c| *c == '.').count();
+    let tail = raw.trim_start_matches('.');
+
+    // One dot is this module's package; each extra dot climbs one level.
+    let mut base: Vec<&str> = scope.package.split('.').filter(|s| !s.is_empty()).collect();
+    for _ in 1..dots {
+        base.pop()?; // climbed past the top of the package
+    }
+    if base.is_empty() {
+        return None;
+    }
+    let mut base = base.join(".");
+    if !tail.is_empty() {
+        base.push('.');
+        base.push_str(tail);
+    }
+    Some(base)
+}
+
+/// `pkg.sub.mod` -> `pkg.sub`.
+fn parent_module(module: &str) -> String {
+    match module.rsplit_once('.') {
+        Some((parent, _)) => parent.to_string(),
+        None => module.to_string(),
     }
 }
 
@@ -171,24 +287,34 @@ fn methods_of(class: Node, src: &[u8]) -> Vec<String> {
     let Some(body) = class.child_by_field_name("body") else {
         return Vec::new();
     };
-    let mut cursor = body.walk();
     let mut methods = Vec::new();
-    for stmt in body.named_children(&mut cursor) {
-        let def = if stmt.kind() == "decorated_definition" {
-            stmt.child_by_field_name("definition")
-        } else {
-            Some(stmt)
-        };
-        if let Some(def) = def {
-            if def.kind() == "function_definition" {
-                if let Some(name) = def.child_by_field_name("name") {
-                    methods.push(text(name, src));
-                }
-            }
-        }
-    }
+    collect_methods(body, src, &mut methods);
     methods.sort();
     methods
+}
+
+/// Methods can sit under `if TYPE_CHECKING:` or `try:` just as easily as at the
+/// top of the body. Descend through those, but never into a nested definition:
+/// those belong to whatever encloses them, not to this class.
+fn collect_methods(node: Node, src: &[u8], out: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let def = if child.kind() == "decorated_definition" {
+            child.child_by_field_name("definition")
+        } else {
+            Some(child)
+        };
+        let Some(def) = def else { continue };
+        match def.kind() {
+            "function_definition" => {
+                if let Some(name) = def.child_by_field_name("name") {
+                    out.push(text(name, src));
+                }
+            }
+            "class_definition" => {}
+            _ => collect_methods(def, src, out),
+        }
+    }
 }
 
 fn decorators_of(node: Node, src: &[u8]) -> Vec<String> {

@@ -2,6 +2,10 @@
 name = "watch-floor"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.90"
+description = "Live view of what your edits are doing to a Python package's structure"
+license = "MIT"
+repository = "https://github.com/SoyBison/watch-floor"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -11,3 +15,6 @@ notify = "8.2.0"
 ratatui = "0.29.0"
 tree-sitter = "0.26.13"
 tree-sitter-python = "0.25.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
